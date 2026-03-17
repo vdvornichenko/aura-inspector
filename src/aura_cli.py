@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import signal
+import re
 from urllib.parse import parse_qs
 
 def audit(url, cookies, object_list, output_dir, proxy, fetch_max_data=False, insecure=False, app=None, aura_path="/aura", context=None, token="null", no_gql=False):
@@ -114,8 +115,22 @@ def write_records_to_directory(all_records, parent_dir, sub_dir):
 	os.makedirs(path_to_write, exist_ok=True)
 
 	logger.info(f'Writing record information to {path_to_write}')
-	with open(os.path.join(path_to_write, f'summary.txt'), 'w') as f:
+
+	# Write summary table
+	with open(os.path.join(path_to_write, 'summary.txt'), 'w') as f:
 		f.write(draw_table(all_records))
+
+	# Write full combined payload
+	with open(os.path.join(path_to_write, 'all_records.json'), 'w') as f:
+		json.dump(all_records, f, indent=2)
+
+	# Write one file per object
+	for object_name, object_data in all_records.items():
+		safe_file_name = re.sub(r'[^A-Za-z0-9_.-]', '_', object_name)
+		file_path = os.path.join(path_to_write, f'{safe_file_name}.json')
+
+		with open(file_path, 'w') as f:
+			json.dump(object_data, f, indent=2)
 
 
 def write_misc_to_directory(obj_to_write, parent_dir, sub_dir='misc', file_name=''):

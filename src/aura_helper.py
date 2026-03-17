@@ -627,18 +627,199 @@ class AuraHelper:
 	def get_records_graphql(self, objects, records_per_action=2000, fetch_all=True):
 		results = {}
 
-		#Retrieve field names for each object and validate that they can be accessed with uiapi
+		def build_record_query(object_name, first_size, after_cursor=None):
+			after_part = f', after: "{after_cursor}"' if after_cursor else ''
+
+			if object_name == 'User':
+				fields_block = """
+									Id
+									Name {
+										value
+									}
+									Email {
+										value
+									}
+				"""
+			else:
+				fields_block = """
+									Id
+									Name {
+										value
+									}
+				"""
+
+			return f'''
+				query getRecords {{
+					uiapi {{
+						query {{
+							{object_name}(first: {first_size}{after_part}) {{
+								edges {{
+									cursor
+									node {{
+{fields_block}
+									}}
+								}}
+								pageInfo {{
+									hasNextPage
+									endCursor
+								}}
+							}}
+						}}
+					}}
+				}}
+			'''
+
+		def parse_record_node(object_name, node):
+			record = {
+				'Id': node.get('Id')
+			}
+
+			if object_name == 'User':
+				record['Name'] = (node.get('Name') or {}).get('value')
+				record['Email'] = (node.get('Email') or {}).get('value')
+			else:
+				record['Name'] = (node.get('Name') or {}).get('value')
+
+			return record
+
+		# Retrieve field names for each object and validate that they can be accessed with uiapi
 		object_fields_map = self.get_graphql_fields_for_objects(objects)
-		uiapi_objects = list(object_fields_map.keys())
+		if not object_fields_map:
+			logger.error("Could not retrieve GraphQL fields for objects")
+			return results
+
+		# Only keep objects we can actually query for the fields we want
+		uiapi_objects = []
+		for object_name, fields in object_fields_map.items():
+			if object_name == 'User':
+				if 'Name' in fields and 'Email' in fields:
+					uiapi_objects.append(object_name)
+				else:
+					logger.debug(f"Skipping {object_name}: Name and/or Email not available through uiapi")
+			else:
+				if 'Name' in fields:
+					uiapi_objects.append(object_name)
+				else:
+					logger.debug(f"Skipping {object_name}: Name not available through uiapi")
+
 		logger.info(f"{len(uiapi_objects)} objects accessible with GraphQL through uiapi")
 
-		logger.info("Hang tight - this may take a while")
+		if not uiapi_objects:
+			logger.info("No GraphQL-queryable objects with required fields were found")
+			return results
 
-		#Retrieve object counts for each object to only retrieve records for those
+		logger.info("Retrieving counts for GraphQL objects")
 		object_count_map = self.get_object_count_graphql(uiapi_objects)
-		objects_with_records = [object_name for object_name in object_count_map if object_count_map[object_name] != 0]
-		results = {k: {'records': [], 'total_count': v} for k, v in object_count_map.items() if v != 0}
-		logger.info(f"{len(objects_with_records)} objects with records for a total of {sum(object_count_map.values())} records")
+
+		objects_with_records = [
+			object_name for object_name, total_count in object_count_map.items()
+			if total_count not in [0, None]
+		]
+
+		results = {
+			object_name: {
+				'records': [],
+				'total_count': total_count
+			}
+			for object_name, total_count in object_count_map.items()
+			if total_count not in [0, None]
+		}
+
+		logger.info(f"{len(objects_with_records)} objects with records identified")
+
+		for object_name in objects_with_records:
+			total_count = object_count_map.get(object_name, 0)
+
+			# If count query returned -1 (too large / unknown), still try to fetch records
+			if total_count == -1:
+				logger.warning(f"{object_name} count is unknown (-1), attempting record retrieval anyway")
+
+			logger.info(f"Retrieving records for {object_name}")
+
+			after_cursor = None
+			page_num = 1
+			retrieved_count = 0
+
+			while True:
+				# Salesforce GraphQL page sizes are typically capped lower than 2000 in practice,
+				# so keep each request moderate.
+				page_size = min(records_per_action, 200)
+
+				query = build_record_query(object_name, page_size, after_cursor)
+
+				action = AuraActionHelper.build_action(
+					f'{object_name};page_{page_num}',
+					'aura://RecordUiController/ACTION$executeGraphQL',
+					{
+						'queryInput': {
+							'operationName': 'getRecords',
+							'query': query,
+							'variables': {},
+						}
+					}
+				)
+
+				try:
+					action_response = self.send_aura_bulk([action], chunk_size=1).actions_responses[0]
+				except Exception:
+					logger.error(f"Error while retrieving records for {object_name}")
+					logger.debug(traceback.format_exc())
+					break
+
+				if not action_response.is_success():
+					logger.debug(f"Could not retrieve records for {object_name}: {action_response.error_message}")
+					break
+
+				return_value = action_response.return_value
+				errors = return_value.get('errors', [])
+				if errors:
+					logger.debug(f"GraphQL returned errors for {object_name}: {json.dumps(errors)}")
+					break
+
+				connection = (
+					return_value
+					.get('data', {})
+					.get('uiapi', {})
+					.get('query', {})
+					.get(object_name, {})
+				)
+
+				edges = connection.get('edges', [])
+				page_info = connection.get('pageInfo', {})
+				has_next_page = page_info.get('hasNextPage', False)
+				after_cursor = page_info.get('endCursor')
+
+				if not edges:
+					logger.verbose(f"No more records returned for {object_name}")
+					break
+
+				for edge in edges:
+					node = edge.get('node', {})
+					record = parse_record_node(object_name, node)
+					results[object_name]['records'].append(record)
+
+				retrieved_count += len(edges)
+				logger.verbose(
+					f"{object_name}: page {page_num}, retrieved {len(edges)} records "
+					f"(total fetched so far: {retrieved_count}, reported count: {total_count})"
+				)
+
+				if not fetch_all:
+					break
+
+				if not has_next_page:
+					break
+
+				if not after_cursor:
+					logger.warning(f"{object_name}: hasNextPage=true but endCursor missing, stopping pagination")
+					break
+
+				page_num += 1
+
+		logger.info(
+			f"Retrieved records for {len(results)} objects "
+			f"with total reported count of {sum([v['total_count'] for v in results.values() if isinstance(v['total_count'], int) and v['total_count'] > 0])}"
+		)
 		return results
 
 	def get_custom_controllers(self):
